@@ -1,11 +1,8 @@
-# File: bots/chatbot/chatbot.py
-
 from dotenv import load_dotenv
 import json
 import os
 import sys
 import logging
-from collections import deque
 import requests
 
 # Load environment variables from .env file if it exists
@@ -34,18 +31,15 @@ logging.basicConfig(filename='app.log', level=logging.DEBUG, format='%(asctime)s
 class ChatBot:
     def __init__(self, prompts_file=None, max_history=30):
         if prompts_file is None:
-            # Set the default path to the prompts.json file within the current directory
             prompts_file = os.path.join(os.path.dirname(__file__), 'prompts.json')
         
         with open(prompts_file, 'r') as f:
             prompts_data = json.load(f)
         self.prompts = prompts_data["prompts"]
-        self.conversation_history = deque(maxlen=max_history)
+        self.max_history = max_history
+        self.conversation_history = []
         
-        # Set the initial prompt label
-        self.initial_prompt_label = "sarcastic_friend"  # Specify the label of the chosen prompt
-        
-        # Store the system message
+        self.initial_prompt_label = "sarcastic_friend"
         self.system_message = self.get_system_message()
 
     def get_system_message(self):
@@ -55,10 +49,26 @@ class ChatBot:
         else:
             raise ValueError(f"Prompt with label '{self.initial_prompt_label}' not found in prompts.")
 
+    def add_message_to_history(self, role, content):
+        # Validate the alternating pattern
+        if self.conversation_history:
+            last_role = self.conversation_history[-1]["role"]
+            if (role == "user" and last_role != "assistant") or (role == "assistant" and last_role != "user"):
+                raise ValueError(f"Invalid message sequence. Expected {last_role} role, but got {role}.")
+
+        # Append the message
+        self.conversation_history.append({"role": role, "content": content})
+        
+        # If over max_history, remove the first two messages
+        if len(self.conversation_history) > self.max_history:
+            self.conversation_history = self.conversation_history[2:]
+            
+        return True
+
     def get_chat_response_text(self, user_message):
         try:
             # Add the user's message to the conversation history
-            self.conversation_history.append({"role": "user", "content": [{"type": "text", "text": user_message}]})
+            self.add_message_to_history("user", [{"type": "text", "text": user_message}])
             
             # Define the tools to call
             tools = [
@@ -89,7 +99,7 @@ class ChatBot:
                 "max_tokens": 1024,
                 "system": self.system_message,
                 "tools": tools,
-                "messages": list(self.conversation_history)
+                "messages": self.conversation_history
             }
 
             response = requests.post(
@@ -112,14 +122,14 @@ class ChatBot:
                             "role": "assistant",
                             "content": response_data.get('content')
                         }
-                        self.conversation_history.append(tool_use)
+                        self.add_message_to_history("assistant", tool_use["content"])
                         print(f"Tool use requested: {tool_name}")
                         print(f"Tool input: {tool_input}")
                         
                         if tool_name == "generate_image":
                             prompt = tool_input.get("prompt")
                             image_url = generate_image(prompt)
-                            logging.debug(f"Image generated with absolute path: {image_url}")
+                            print(f"Image generated with absolute path: {image_url}")
                             # Prepare tool result
                             tool_result = {
                                 "role": "user",
@@ -132,11 +142,12 @@ class ChatBot:
                                 ]
                             }
                             # Add tool result to conversation history
-                            self.conversation_history.append(tool_result)
+                            if self.add_message_to_history("user", tool_result["content"]):
+                                print('added tool result to history')
                 
                 # Make another API call with the tool result
-                data["messages"] = list(self.conversation_history)
-                data["system"] = "take this result and print it to the user with markdown format"
+                data["messages"] = self.conversation_history
+                data["system"] = "use this image_url to response the user with markup image link"
                 print(data["messages"])
                 response = requests.post(
                     "https://api.anthropic.com/v1/messages",
@@ -144,21 +155,13 @@ class ChatBot:
                     json=data
                 )
                 response_data = response.json()
+                print(response_data)
                 if response.status_code != 200:
                     raise Exception(f"API request failed with status {response.status_code}: {response_data}")
-            # Append the final assistant message to the conversation history
-            if not response_data.get('content'):
-                last_message = self.conversation_history[-1]
-                if last_message['role'] == 'user' and last_message['content'][0]['type'] == 'tool_result':
-                    image_url = last_message['content'][0]['content']
-                    response_data['content'] = [{'type': 'text', 'text': f'![{image_url}]({image_url})'}]
+                response_data['content'] = response_data.get('content', [{"type": "text", "text": f"![{image_url}]"}])
 
-            # Append the final assistant message to the conversation history
-            self.conversation_history.append({
-                "role": "assistant",
-                "content": response_data.get('content', [])
-            })
-            print(self.conversation_history)
+            # Add the assistant's response to the conversation history
+            self.add_message_to_history("assistant", response_data.get('content', []))
 
             # Extract and return the text response
             assistant_response = ""
@@ -188,3 +191,12 @@ class ChatBot:
 
 # Instantiate ChatBot
 chatbot = ChatBot()
+
+# Example usage
+if __name__ == "__main__":
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() in ['exit', 'quit', 'bye']:
+            break
+        response = chatbot.get_chat_response_text(user_input)
+        print("ChatBot:", response)
